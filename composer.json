@@ -1,0 +1,17 @@
+{
+    "name": "php-baremetal/esp32-executor",
+    "description": "ESP32 executor task: device pollers and work run on a core-1 task with an internal-RAM stack.",
+    "type": "bm-lib",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Gianfrancesco Aurecchia",
+            "email": "gianfri@aurecchia.com"
+        }
+    ],
+    "extra": {
+        "baremetal": {
+            "idf-requires": ["esp_timer"]
+        }
+    }
+}
