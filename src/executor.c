@@ -12,6 +12,7 @@
 */
 
 #include "executor.h"
+#include "poll_wait.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -60,7 +61,6 @@ static executor_poller_t s_pollers[MAX_POLLERS];
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_intent_q;
 static TaskHandle_t  s_task;
-static volatile int  s_poller_count;
 
 static uint32_t now_ms(void)
 {
@@ -93,16 +93,33 @@ static void service_pollers(void)
                 portEXIT_CRITICAL(&s_mux);
             }
         }
-        p->next_due = now + p->period_ms;
+        p->next_due = poll_next_due(p->next_due, now, p->period_ms);
     }
+}
+
+/* Block until the earliest sampler is due, or until work arrives when there is none: the chip can then
+ * light-sleep between samples. A poller added meanwhile nudges the queue. */
+static TickType_t next_wait(void)
+{
+    uint32_t due[MAX_POLLERS];
+    size_t n = 0;
+    for (int i = 0; i < MAX_POLLERS; i++) {
+        if (s_pollers[i].active) {
+            due[n++] = s_pollers[i].next_due;
+        }
+    }
+    uint32_t ms = poll_wait_ms(now_ms(), due, n);
+    if (ms == POLL_WAIT_FOREVER) {
+        return portMAX_DELAY;
+    }
+    return (TickType_t) poll_wait_ticks(ms, configTICK_RATE_HZ);
 }
 
 static void executor_task(void *arg)
 {
     (void) arg;
     for (;;) {
-        /* One-tick wait while polling (keeps cadence, feeds the watchdog); block until work otherwise. */
-        TickType_t wait = s_poller_count ? 1 : portMAX_DELAY;
+        TickType_t wait = next_wait();
         executor_intent_t it;
         if (xQueueReceive(s_intent_q, &it, wait) == pdTRUE && it.fn) {
             esp_err_t r = it.fn(it.arg);                 /* sole owner -- no lock */
@@ -222,7 +239,6 @@ executor_poller_t *executor_poll(esp_err_t (*sample)(void *dev, void *out),
     portENTER_CRITICAL(&s_mux);
     slot->active = true;                 /* published last */
     portEXIT_CRITICAL(&s_mux);
-    s_poller_count++;
 
     executor_ensure_started();
     if (s_intent_q) {

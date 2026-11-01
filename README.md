@@ -33,9 +33,9 @@ it adds it to its own `composer.json` and includes `executor.h`:
 | Work queue | 16 entries |
 | Started | lazily, by the first `executor_run_sync()` or `executor_poll()`; a firmware that uses neither has no task |
 
-The task blocks on its work queue. While at least one poller is registered it wakes every FreeRTOS tick
-(1 ms) instead, to keep the sampling cadence; work and samplers run one after the other on the task, never
-at the same time.
+The task blocks on its work queue. While samplers are registered it waits at most until the earliest one is
+due, so it wakes once per sampling period and the chip can light-sleep in between; work and samplers run one
+after the other on the task, never at the same time.
 
 ## Running work: executor_run_sync()
 
@@ -78,9 +78,8 @@ size_t executor_poll_drain(executor_poller_t *p, void *out, size_t max_samples);
 | Sample size | 1 to 64 bytes |
 | Ring depth | 1 to 256 samples (0 means 64; larger is clamped) |
 
-Samplers are never removed: there is no call that stops one, and the task keeps waking every tick while any
-exists, which also keeps the chip from light-sleeping for longer than a tick when the `power-save` option is
-on.
+Samplers are never removed: there is no call that stops one. Each keeps waking the task once per period, so
+with the `power-save` option on the chip never sleeps longer than the shortest period.
 
 ## License
 
