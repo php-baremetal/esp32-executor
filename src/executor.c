@@ -13,12 +13,14 @@
 
 #include "executor.h"
 #include "poll_wait.h"
+#include "irq_queue.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -30,6 +32,7 @@
 #define MAX_SAMPLE      64
 #define MAX_DEPTH       256
 #define INTENT_QUEUE_DEPTH  16
+#define MAX_IRQ_JOBS    4
 
 /* A unit of work for the executor. fn==NULL is a wake no-op; done is given after fn runs; result gets
  * fn's return. */
@@ -58,7 +61,17 @@ struct executor_poller {
     volatile uint32_t notify_done;   /* notifies finished; runs are serial on the executor task */
 };
 
+/* An on-demand job (executor_irq): runs on the executor task only when kicked or due. Cancel runs on the
+ * executor task too (serial with the services), so it never overlaps a run and frees the job itself. */
+struct executor_irq {
+    irq_state_t st;
+    esp_err_t (*service)(void *dev);
+    void     *dev;
+};
+
 static executor_poller_t s_pollers[MAX_POLLERS];
+/* Job slots: filled under s_mux by executor_irq(); a slot is emptied only by the executor task. */
+static executor_irq_t *volatile s_irq[MAX_IRQ_JOBS];
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_intent_q;
 static TaskHandle_t  s_task;
@@ -66,6 +79,25 @@ static TaskHandle_t  s_task;
 static uint32_t now_ms(void)
 {
     return (uint32_t) (esp_timer_get_time() / 1000);
+}
+
+/* Run each job that is owed one. Only the executor task runs services and empties slots (cancel runs
+ * there too), so a job is never freed while its service runs. A service may cancel its own job: nothing
+ * touches j after service() returns. */
+static void service_irq_jobs(void)
+{
+    for (int i = 0; i < MAX_IRQ_JOBS; i++) {
+        executor_irq_t *j = s_irq[i];
+        if (!j) {
+            continue;
+        }
+        portENTER_CRITICAL(&s_mux);
+        bool run = irq_take(&j->st, (uint64_t) esp_timer_get_time());
+        portEXIT_CRITICAL(&s_mux);
+        if (run) {
+            j->service(j->dev);                          /* sole owner of the bus -- no lock */
+        }
+    }
 }
 
 static void service_pollers(void)
@@ -102,14 +134,27 @@ static void service_pollers(void)
  * light-sleep between samples. A poller added meanwhile nudges the queue. */
 static TickType_t next_wait(void)
 {
-    uint32_t due[MAX_POLLERS];
+    uint32_t due[MAX_POLLERS + MAX_IRQ_JOBS];
     size_t n = 0;
     for (int i = 0; i < MAX_POLLERS; i++) {
         if (s_pollers[i].active && !s_pollers[i].paused) {
             due[n++] = s_pollers[i].next_due;
         }
     }
-    uint32_t ms = poll_wait_ms(now_ms(), due, n);
+    uint32_t now = now_ms();
+    for (int i = 0; i < MAX_IRQ_JOBS; i++) {
+        executor_irq_t *j = s_irq[i];
+        if (!j) {
+            continue;
+        }
+        portENTER_CRITICAL(&s_mux);
+        uint64_t d = irq_next_due(&j->st);
+        portEXIT_CRITICAL(&s_mux);
+        if (d != IRQ_NO_DUE) {
+            due[n++] = d == 0 ? now : (uint32_t) ((d + 999) / 1000);
+        }
+    }
+    uint32_t ms = poll_wait_ms(now, due, n);
     if (ms == POLL_WAIT_FOREVER) {
         return portMAX_DELAY;
     }
@@ -132,6 +177,7 @@ static void executor_task(void *arg)
             }
         }
         service_pollers();
+        service_irq_jobs();
     }
 }
 
@@ -313,4 +359,110 @@ size_t executor_poll_drain(executor_poller_t *p, void *out, size_t max_samples)
     }
     portEXIT_CRITICAL(&s_mux);
     return n;
+}
+
+/* Nudge the task out of its wait from a task. */
+static void irq_wake(void)
+{
+    if (s_intent_q) {
+        executor_intent_t wake = { 0 };
+        xQueueSend(s_intent_q, &wake, 0);
+    }
+}
+
+executor_irq_t *executor_irq(esp_err_t (*service)(void *dev), void *dev)
+{
+    if (!service || !executor_ensure_started()) {        /* start first: a placed job always has a task */
+        return NULL;
+    }
+    executor_irq_t *j = calloc(1, sizeof(*j));
+    if (!j) {
+        return NULL;
+    }
+    irq_init(&j->st);
+    j->service = service;
+    j->dev = dev;
+    bool placed = false;
+    portENTER_CRITICAL(&s_mux);
+    for (int i = 0; i < MAX_IRQ_JOBS; i++) {
+        if (!s_irq[i]) {
+            s_irq[i] = j;                                /* published last: fully built above */
+            placed = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_mux);
+    if (!placed) {
+        free(j);
+        return NULL;
+    }
+    return j;
+}
+
+/* fn == NULL: a wake no-op. In DRAM and sent by address (the queue copies it), so the ISR builds nothing. */
+static const DRAM_ATTR executor_intent_t k_wake_item = { 0 };
+
+/* ISR-safe: atomics and the FromISR queue send only. The handler must be removed before executor_irq_cancel(),
+ * which frees the job. */
+void IRAM_ATTR executor_irq_kick_from_isr(executor_irq_t *j)
+{
+    if (!j) {
+        return;
+    }
+    irq_kick(&j->st);
+    if (s_intent_q) {
+        BaseType_t woken = pdFALSE;
+        xQueueSendFromISR(s_intent_q, &k_wake_item, &woken);    /* full: the task is busy and will see pending */
+        if (woken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    }
+}
+
+void executor_irq_after(executor_irq_t *j, uint32_t ms)
+{
+    if (!j) {
+        return;
+    }
+    portENTER_CRITICAL(&s_mux);
+    irq_after(&j->st, (uint64_t) esp_timer_get_time(), ms);
+    portEXIT_CRITICAL(&s_mux);
+    irq_wake();
+}
+
+void executor_irq_pause(executor_irq_t *j, bool paused)
+{
+    if (!j) {
+        return;
+    }
+    portENTER_CRITICAL(&s_mux);
+    irq_pause(&j->st, paused);
+    portEXIT_CRITICAL(&s_mux);
+}
+
+/* Runs on the executor task: no service is running (or it is the caller itself, returning next). */
+static esp_err_t irq_cancel_on_task(void *arg)
+{
+    executor_irq_t *j = arg;
+    portENTER_CRITICAL(&s_mux);
+    irq_cancel(&j->st);
+    for (int i = 0; i < MAX_IRQ_JOBS; i++) {
+        if (s_irq[i] == j) {
+            s_irq[i] = NULL;
+        }
+    }
+    portEXIT_CRITICAL(&s_mux);
+    free(j);
+    return ESP_OK;
+}
+
+void executor_irq_cancel(executor_irq_t *j)
+{
+    if (!j) {
+        return;
+    }
+    /* Serialized with the services on the executor task, inline when called from one (no deadlock). On
+     * return service(dev) is not running and never runs again. A full queue only delays us: retry. */
+    while (executor_run_sync(irq_cancel_on_task, j, 1000) == ESP_ERR_TIMEOUT) {
+    }
 }

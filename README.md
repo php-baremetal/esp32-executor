@@ -83,6 +83,27 @@ size_t executor_poll_drain(executor_poller_t *p, void *out, size_t max_samples);
 Samplers are never removed; `executor_poll_pause()` pauses one, and a paused sampler does not wake the task. Each running sampler keeps waking the task once per period, so
 with the `power-save` option on the chip never sleeps longer than the shortest period.
 
+## On-demand jobs: executor_irq()
+
+```c
+executor_irq_t *executor_irq(esp_err_t (*service)(void *dev), void *dev);
+void executor_irq_kick_from_isr(executor_irq_t *j);
+void executor_irq_after(executor_irq_t *j, uint32_t ms);
+void executor_irq_pause(executor_irq_t *j, bool paused);
+void executor_irq_cancel(executor_irq_t *j);
+```
+
+| Function | Called from | Does |
+| --- | --- | --- |
+| `executor_irq()` | a task | Registers a job: `service(dev)` runs on the executor task, and only when asked (no periodic wake-ups). Starts the executor if needed. Returns NULL with no free slot (4 in the firmware) or no memory. |
+| `executor_irq_kick_from_isr()` | an interrupt handler | Asks for one run as soon as the executor can. A second kick before the run is merged into it. Only touches atomics and wakes the task with the FromISR queue send. |
+| `executor_irq_after()` | a task | Asks for one run after `ms`, replacing a delayed run still pending. An immediate kick wins and absorbs the delayed run. |
+| `executor_irq_pause()` | a task | Paused, new kicks are dropped, and so are a pending kick and a pending delayed run (also one racing the pause). A run already taken by the executor may still execute once after pause returns. Resuming (`false`) on a job that is not paused changes nothing: a pending run survives. |
+| `executor_irq_cancel()` | a task | No more runs, and the job is freed. It runs on the executor task, serial with the services: it waits for a running `service()` to finish (inline when called from a service, so no deadlock). On return `service(dev)` is not running and never starts again, so the caller may free `dev`. Remove the interrupt handler that kicks the job before calling it (and make sure no ISR is still running on another core): the handle is invalid once cancel returns. |
+
+`service()` runs on core 0 after the pollers, as sole owner of the bus (no lock needed), and its result is
+ignored. The executor blocks until the earliest poller or delayed run is due, so an idle job lets the chip sleep.
+
 ## License
 
 MIT.

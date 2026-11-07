@@ -46,6 +46,25 @@ bool executor_poll_latest(executor_poller_t *p, void *out);
  * and mark them read. Returns how many were copied. */
 size_t executor_poll_drain(executor_poller_t *p, void *out, size_t max_samples);
 
+typedef struct executor_irq executor_irq_t;
+
+/* A job run on the executor task only when asked; dev is passed to service. NULL without memory (or when all
+ * slots are taken). Starts the executor lazily. */
+executor_irq_t *executor_irq(esp_err_t (*service)(void *dev), void *dev);
+/* From an ISR: run the job once as soon as the executor can; a second kick before it runs is merged. */
+void executor_irq_kick_from_isr(executor_irq_t *j);
+/* From a task: run the job once after ms (replaces a pending delayed run). */
+void executor_irq_after(executor_irq_t *j, uint32_t ms);
+/* paused: new kicks are dropped and so are a pending kick and a pending delayed run, also those racing the call;
+ * a run already taken completes. Resume only un-pauses; on a job that is not paused it changes nothing. */
+void executor_irq_pause(executor_irq_t *j, bool paused);
+/* No more runs, and the job is freed. Blocks until the executor task is between services (inline when
+ * called from a service, even of this job), so on return service(dev) is not running and never starts:
+ * the caller may free dev. The caller removes the interrupt handler that kicks the job BEFORE cancel
+ * (and waits out an ISR still running on another core): a kick after cancel touches freed memory. Pause
+ * is weaker: a run already taken may still execute once after it returns. */
+void executor_irq_cancel(executor_irq_t *j);
+
 /* Run fn(arg) on the executor task and block until done, returning its result; run inline if already on
  * the task. Starts the executor lazily. A full queue for enqueue_timeout_ms returns ESP_ERR_TIMEOUT. */
 esp_err_t executor_run_sync(esp_err_t (*fn)(void *arg), void *arg, uint32_t enqueue_timeout_ms);

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- Added: executor_irq(), a job run on the executor task only when asked (executor_irq_kick_from_isr() from an interrupt, executor_irq_after() for a delayed run), with pause and cancel (cancel waits out a running service, so the caller may free its dev afterwards). The interrupt-side kick builds its queue item field by field, so it calls no memset from interrupt context.
+
 ## 1.1.0
 
 - Added: executor_poll_pause(), which pauses a poller (no samples, no wake-ups) and resumes it.
