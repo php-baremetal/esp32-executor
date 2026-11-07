@@ -42,6 +42,7 @@ typedef struct {
 
 struct executor_poller {
     bool      active;
+    volatile bool paused;    /* no samples, not counted in the wait (executor_poll_pause); set under s_mux */
     esp_err_t (*sample)(void *dev, void *out);
     void     *dev;
     size_t    sample_size;
@@ -72,7 +73,7 @@ static void service_pollers(void)
     uint32_t now = now_ms();
     for (int i = 0; i < MAX_POLLERS; i++) {
         executor_poller_t *p = &s_pollers[i];
-        if (!p->active || (int32_t) (now - p->next_due) < 0) {
+        if (!p->active || p->paused || (int32_t) (now - p->next_due) < 0) {
             continue;
         }
         uint8_t tmp[MAX_SAMPLE];
@@ -104,7 +105,7 @@ static TickType_t next_wait(void)
     uint32_t due[MAX_POLLERS];
     size_t n = 0;
     for (int i = 0; i < MAX_POLLERS; i++) {
-        if (s_pollers[i].active) {
+        if (s_pollers[i].active && !s_pollers[i].paused) {
             due[n++] = s_pollers[i].next_due;
         }
     }
@@ -236,6 +237,7 @@ executor_poller_t *executor_poll(esp_err_t (*sample)(void *dev, void *out),
     slot->notify_arg = NULL;
     slot->notify_started = 0;
     slot->notify_done = 0;
+    slot->paused = false;
     portENTER_CRITICAL(&s_mux);
     slot->active = true;                 /* published last */
     portEXIT_CRITICAL(&s_mux);
@@ -246,6 +248,23 @@ executor_poller_t *executor_poll(esp_err_t (*sample)(void *dev, void *out),
         xQueueSend(s_intent_q, &wake, 0);
     }
     return slot;
+}
+
+void executor_poll_pause(executor_poller_t *p, bool paused)
+{
+    if (!p) {
+        return;
+    }
+    portENTER_CRITICAL(&s_mux);
+    if (!paused && p->paused) {
+        p->next_due = now_ms();          /* the next sample is due now */
+    }
+    p->paused = paused;
+    portEXIT_CRITICAL(&s_mux);
+    if (!paused && s_intent_q) {
+        executor_intent_t wake = { 0 };   /* the task may be blocked with no deadline: nudge it */
+        xQueueSend(s_intent_q, &wake, 0);
+    }
 }
 
 void executor_poll_on_sample(executor_poller_t *p, void (*notify)(void *arg), void *arg)

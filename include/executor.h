@@ -31,6 +31,9 @@ typedef struct executor_poller executor_poller_t;
 executor_poller_t *executor_poll(esp_err_t (*sample)(void *dev, void *out),
                                  void *dev, size_t sample_size, uint32_t hz, size_t depth);
 
+/* Pause (true) or resume (false) a poller. Paused, it takes no samples and does not count in the executor's wait; ring and unread samples stay. On resume the next sample is due now. */
+void executor_poll_pause(executor_poller_t *p, bool paused);
+
 /* Install a notify called on core 0 right after each new sample is stored (outside the ring lock).
  * It must not block or touch PHP -- a source uses it to post a cross-core message (a queue send). NULL
  * clears it. arg is passed through. On return no call of the previous notify is running or can start. */

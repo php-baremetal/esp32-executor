@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.0
+
+- Added: executor_poll_pause(), which pauses a poller (no samples, no wake-ups) and resumes it.
+
 ## 1.0.2
 
 - Fixed: while a sampler was registered the executor woke every FreeRTOS tick (1 ms), which kept the chip

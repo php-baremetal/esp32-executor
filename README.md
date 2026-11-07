@@ -58,6 +58,7 @@ owned by the executor).
 ```c
 executor_poller_t *executor_poll(esp_err_t (*sample)(void *dev, void *out),
                                  void *dev, size_t sample_size, uint32_t hz, size_t depth);
+void   executor_poll_pause(executor_poller_t *p, bool paused);
 void   executor_poll_on_sample(executor_poller_t *p, void (*notify)(void *arg), void *arg);
 bool   executor_poll_latest(executor_poller_t *p, void *out);
 size_t executor_poll_drain(executor_poller_t *p, void *out, size_t max_samples);
@@ -66,6 +67,7 @@ size_t executor_poll_drain(executor_poller_t *p, void *out, size_t max_samples);
 | Function | Does |
 | --- | --- |
 | `executor_poll()` | Registers a sampler: the executor calls `sample(dev, out)` every `1000 / hz` ms (whole milliseconds, at least 1) and stores each successful sample in a ring of `depth` slots. A second call with the same `sample` and `dev` only changes the rate. Returns NULL for a size of 0 or over 64 bytes, `hz` 0, no free slot, or no memory. |
+| `executor_poll_pause()` | Pauses (`true`) or resumes (`false`) a poller. Paused, it takes no samples and does not count in the executor's wait, so the chip can sleep through it; the ring and its unread samples stay. On resume the next sample is due now. A sample already being taken when the pause comes can still land in the ring. |
 | `executor_poll_on_sample()` | Installs a callback run on the executor right after each stored sample, outside the ring lock. It must not block or touch PHP: post to a queue (ext-i2c calls `bm_events_emit()`). On return, no call of the previous callback is running. |
 | `executor_poll_latest()` | Copies the most recent sample; false before the first one. |
 | `executor_poll_drain()` | Copies up to `max_samples` unread samples, oldest first, and marks them read. Samples overwritten by a full ring are lost. |
@@ -78,7 +80,7 @@ size_t executor_poll_drain(executor_poller_t *p, void *out, size_t max_samples);
 | Sample size | 1 to 64 bytes |
 | Ring depth | 1 to 256 samples (0 means 64; larger is clamped) |
 
-Samplers are never removed: there is no call that stops one. Each keeps waking the task once per period, so
+Samplers are never removed; `executor_poll_pause()` pauses one, and a paused sampler does not wake the task. Each running sampler keeps waking the task once per period, so
 with the `power-save` option on the chip never sleeps longer than the shortest period.
 
 ## License
